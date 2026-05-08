@@ -35,25 +35,22 @@ if len(sys.argv) < 4 or not os.path.isdir(sys.argv[2]) or not os.path.isdir(sys.
     print("Usage: [release_tag, format: v1.2.3.4] [artifact_dir] [jdbc_root_path]")
     exit(1)
 
-version_regex = re.compile(r'^v((\d+)\.(\d+)\.\d+\.\d+)$')
+version_regex = re.compile(r'^v((\d+)\.(\d+)\.\d+\.\d+(?:-[\w.-]+)?)$')
 release_tag = sys.argv[1]
 deploy_url = 'https://central.sonatype.com/api/v1/publisher/upload'
 is_release = True
 
-if release_tag == 'main':
-    # for SNAPSHOT builds we increment the minor version and set patch level to zero.
-    # seemed the most sensible
+if version_regex.match(release_tag):
+    release_version = version_regex.search(release_tag).group(1)
+else:
+    # for SNAPSHOT builds (main or any non-tag ref) we increment the minor
+    # version of the latest release tag and set patch level to zero.
     last_tag = exec('git tag --sort=-committerdate').decode('utf8').split('\n')[0]
     re_result = version_regex.search(last_tag)
     if re_result is None:
         raise ValueError("Could not parse last tag %s" % last_tag)
     release_version = "%d.%d.0.0-SNAPSHOT" % (int(re_result.group(2)), int(re_result.group(3)) + 1)
     is_release = False
-elif version_regex.match(release_tag):
-    release_version = version_regex.search(release_tag).group(1)
-else:
-    print("Not running on %s" % release_tag)
-    exit(0)
 
 jdbc_artifact_dir = sys.argv[2]
 jdbc_root_path = sys.argv[3]
@@ -215,19 +212,93 @@ for file in files_to_deploy:
 subprocess.run(["ls", "-laR", bundle_root_dir])
 subprocess.run(["zip", "-qr", bundle_zip, "org"], cwd=bundle_root_dir)
 
-maven_username = os.environ["MAVEN_USERNAME"]
-maven_password = os.environ["MAVEN_PASSWORD"]
-token = base64.b64encode(f"{maven_username}:{maven_password}".encode("utf-8")).decode("utf-8")
+# copy bundle zip to current working directory so it can be picked up as a
+# GitHub Actions artifact by the maven-deploy workflow job
+bundle_zip_output = path.join(os.getcwd(), "central-bundle.zip")
+shutil.copyfile(bundle_zip, bundle_zip_output)
+print("Bundle zip copied to: %s" % bundle_zip_output)
 
-subprocess.run([
-  "curl",
-  # "--verbose", do NOT enable it on CI, it leaks the auth token
-  "--silent",
-  "--header", f"Authorization: Bearer {token}",
-  "--form", f"name={release_version}",
-  "--form", "publishingType=AUTOMATIC",
-  "--form", f"bundle=@{bundle_zip}",
-  deploy_url,
-  ], cwd=bundle_root_dir, check=True)
+# ---------------------------------------------------------------------------
+# Deploy to JFrog Artifactory
+# ---------------------------------------------------------------------------
+# The bundle_dir already contains every file in a Maven repository layout
+# (jars, pom, .asc signatures, .md5/.sha1/.sha256 checksums) under
+# org/duckdb/duckdb_jdbc/<version>/. Artifactory natively accepts HTTP PUT
+# uploads against that same path, so we don't need Maven installed.
+#
+# Auth is taken from ARTIFACTORY_CREDENTIALS_USR / ARTIFACTORY_CREDENTIALS_PSW
+# (matches Tealium's internal convention). If the variables are not set the
+# deployment step is skipped, which lets the script still run for local
+# builds or PR jobs without credentials.
+artifactory_user = os.environ.get("ARTIFACTORY_CREDENTIALS_USR")
+artifactory_password = os.environ.get("ARTIFACTORY_CREDENTIALS_PSW")
+artifactory_base_url = os.environ.get(
+    "ARTIFACTORY_BASE_URL", "https://tealium.jfrog.io/artifactory"
+)
+artifactory_release_repo = os.environ.get(
+    "ARTIFACTORY_RELEASE_REPO", "maven-ext-local-release"
+)
+artifactory_snapshot_repo = os.environ.get(
+    "ARTIFACTORY_SNAPSHOT_REPO", "maven-ext-local-snapshot"
+)
+
+if artifactory_user and artifactory_password:
+    target_repo = artifactory_release_repo if is_release else artifactory_snapshot_repo
+    artifact_path = "org/duckdb/duckdb_jdbc/%s" % release_version
+    upload_base_url = "%s/%s/%s" % (
+        artifactory_base_url.rstrip("/"),
+        target_repo,
+        artifact_path,
+    )
+    print("Deploying to Artifactory: %s" % upload_base_url)
+
+    for file_name in sorted(os.listdir(bundle_dir)):
+        src_file = path.join(bundle_dir, file_name)
+        if not path.isfile(src_file):
+            continue
+        upload_url = "%s/%s" % (upload_base_url, file_name)
+        print("  uploading %s" % file_name)
+        subprocess.run(
+            [
+                "curl",
+                # do NOT enable --verbose on CI, it leaks the auth token
+                "--silent",
+                "--show-error",
+                "--fail",
+                "--user",
+                "%s:%s" % (artifactory_user, artifactory_password),
+                "--upload-file",
+                src_file,
+                upload_url,
+            ],
+            check=True,
+        )
+    print("Artifactory deploy complete (version=%s, repo=%s)" % (release_version, target_repo))
+else:
+    print(
+        "ARTIFACTORY_CREDENTIALS_USR / ARTIFACTORY_CREDENTIALS_PSW not set; "
+        "skipping Artifactory deploy"
+    )
+
+# ---------------------------------------------------------------------------
+# Sonatype Central Portal upload (disabled)
+# ---------------------------------------------------------------------------
+# for this to work, you must have MAVEN_USERNAME and MAVEN_PASSWORD
+# environment variables for the Sonatype Central Portal
+
+# maven_username = os.environ["MAVEN_USERNAME"]
+# maven_password = os.environ["MAVEN_PASSWORD"]
+# token = base64.b64encode(f"{maven_username}:{maven_password}".encode("utf-8")).decode("utf-8")
+
+# subprocess.run([
+#   "curl",
+#   # "--verbose", do NOT enable it on CI, it leaks the auth token
+#   "--silent",
+#   "--header", f"Authorization: Bearer {token}",
+#   "--form", f"name={release_version}",
+#   "--form", "publishingType=AUTOMATIC",
+#   "--form", f"bundle=@{bundle_zip}",
+#   deploy_url,
+#   ], cwd=bundle_root_dir, check=True)
 
 print("Done?")
