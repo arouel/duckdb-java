@@ -43,13 +43,31 @@ is_release = True
 if version_regex.match(release_tag):
     release_version = version_regex.search(release_tag).group(1)
 else:
-    # for SNAPSHOT builds (main or any non-tag ref) we increment the minor
-    # version of the latest release tag and set patch level to zero.
-    last_tag = exec('git tag --sort=-committerdate').decode('utf8').split('\n')[0]
-    re_result = version_regex.search(last_tag)
-    if re_result is None:
-        raise ValueError("Could not parse last tag %s" % last_tag)
-    release_version = "%d.%d.0.0-SNAPSHOT" % (int(re_result.group(2)), int(re_result.group(3)) + 1)
+    # SNAPSHOT build (main or any non-tag ref).
+    # Version resolution order:
+    #   1. SNAPSHOT_VERSION env var (explicit override, used as-is)
+    #   2. latest git tag matching the version regex -> bump minor
+    #   3. fallback to "0.0.0.0-SNAPSHOT" so the build still produces a
+    #      bundle even on a fork without any release tags.
+    release_version = None
+    override = os.environ.get("SNAPSHOT_VERSION")
+    if override:
+        release_version = override
+    else:
+        last_tag = exec('git tag --sort=-committerdate').decode('utf8').split('\n')[0].strip()
+        if last_tag:
+            re_result = version_regex.search(last_tag)
+            if re_result is None:
+                print("Could not parse last tag %s, falling back to default" % last_tag)
+            else:
+                release_version = "%d.%d.0.0-SNAPSHOT" % (
+                    int(re_result.group(2)),
+                    int(re_result.group(3)) + 1,
+                )
+        else:
+            print("No git tags found, falling back to default SNAPSHOT version")
+    if release_version is None:
+        release_version = "0.0.0.0-SNAPSHOT"
     is_release = False
 
 jdbc_artifact_dir = sys.argv[2]
